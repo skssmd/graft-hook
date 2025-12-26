@@ -1,0 +1,21 @@
+version: "3.8"
+services:
+    graft-hook:
+        image: ghcr.io/skssmd/graft-hook:latest
+        env_file:
+            - ./env/graft-hook.env
+        labels:
+            - graft.mode=serverbuild
+            - traefik.enable=true
+            - traefik.http.routers.graft-hook.docusup.com-frontend.rule=Host(`graft_hook`)
+            - traefik.http.routers.graft_hook-frontend.priority=1
+            - traefik.http.services.graft-hook.docusup.com-frontend.loadbalancer.server.port=3000
+        networks:
+            - graft-public
+        restart: always
+        volumes:
+            - /var/run/docker.sock:/var/run/docker.sock
+            - /opt/graft:/opt/graft/
+networks:
+    graft-public:
+        external: true
