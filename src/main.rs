@@ -6,17 +6,18 @@ use futures_util::stream::StreamExt;
 use git2::Repository;
 use serde::Deserialize;
 use std::{collections::HashMap, env, sync::Arc};
-use tokio::process::Command; // Added for running shell commands
+use tokio::process::Command;
+use tracing::{info, error, warn, debug, instrument}; // New imports for logging
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)] // Added Debug for better payload logging
 struct WebhookPayload {
     project: String,
+    repository: String,
     githubtoken: String,
     user: String,
-    r#type: String, // "repo" or "image"
+    r#type: String,
 }
 
-// Fixed: ConfigFile is now a HashMap to match your "key": "value" JSON structure
 type ConfigFile = HashMap<String, String>;
 
 struct AppState {
@@ -26,79 +27,149 @@ struct AppState {
 
 #[tokio::main]
 async fn main() {
-    dotenvy::dotenv().ok();
-    
-    let config_path = env::var("configpath").expect("ENV 'configpath' not set");
-    let config_content = std::fs::read_to_string(config_path).expect("Failed to read config");
-    
-    // Parses directly into a HashMap
-    let config: ConfigFile = serde_json::from_str(&config_content)
-        .expect("JSON format mismatch: Expected a flat object like { \"name\": \"path\" }");
+    // 1. Initialize Logging (Tracing Subscriber)
+    tracing_subscriber::fmt()
+        .with_target(false) // Keeps logs clean
+        .compact()          // One-line logs
+        .init();
 
-    let docker = Docker::connect_with_unix_defaults().expect("Failed to connect to Docker");
+    dotenvy::dotenv().ok();
+    info!("🚀 Initializing Graft-Hook Server...");
+
+    let config_path = env::var("configpath").unwrap_or_else(|_| "projects.json".to_string());
+    debug!("Reading config from: {}", config_path);
+
+    let config_content = std::fs::read_to_string(&config_path)
+        .expect("CRITICAL: Failed to read config file");
+    
+    let config: ConfigFile = serde_json::from_str(&config_content)
+        .expect("CRITICAL: JSON format mismatch in config");
+    
+    info!("Loaded {} project(s) from config", config.len());
+
+    let docker = Docker::connect_with_unix_defaults().expect("CRITICAL: Docker connection failed");
     let state = Arc::new(AppState { config, docker });
 
-    let app = Router::new().route("/webhook", post(handle_deploy)).with_state(state);
+    let app = Router::new()
+        .route("/webhook", post(handle_deploy))
+        .with_state(state);
+
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+    info!("✅ Server listening on http://0.0.0.0:3000");
     
-    println!("🚀 Webhook server running on port 3000");
     axum::serve(listener, app).await.unwrap();
 }
 
+// #[instrument] automatically logs the function arguments (excluding sensitive state)
+#[instrument(skip(state, payload), fields(project = %payload.project, mode = %payload.r#type))]
 async fn handle_deploy(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<WebhookPayload>,
 ) -> &'static str {
-    // Lookup path from HashMap key
+    info!("📥 Webhook request received");
+
+    // 1. Lookup Project Path
     let project_path = match state.config.get(&payload.project) {
-        Some(path) => path,
-        None => return "Project not found in config",
+        Some(path) => {
+            debug!("Project matched: Path is {}", path);
+            path
+        },
+        None => {
+            error!("Project '{}' not found in projects.json", payload.project);
+            return "Project not found in config";
+        }
     };
 
-    if payload.r#type == "repo" {
-        if let Ok(repo) = Repository::open(project_path) {
-            let mut remote = repo.find_remote("origin").unwrap();
-            remote.fetch(&["main"], None, None).unwrap();
-            return "Git Fetch Complete";
+    // 2. Select Deployment Mode
+    match payload.r#type.as_str() {
+        "repo" => {
+            info!("Mode selected: Git Pull (Native Git2)");
+            deploy_git(project_path).await
         }
-    } else if payload.r#type == "image" {
-        let auth = DockerCredentials {
-            username: Some(payload.user.clone()),
-            password: Some(payload.githubtoken.clone()),
-            serveraddress: Some("ghcr.io".to_string()),
-            ..Default::default()
-        };
+        "image" => {
+            info!("Mode selected: Docker Pull & Compose (Bollard)");
+            deploy_docker(&state.docker, project_path, &payload).await
+        }
+        _ => {
+            warn!("Invalid deployment type received: {}", payload.r#type);
+            "Invalid Type"
+        }
+    }
+}
 
-        // 1. Pull the image
-        let mut stream = state.docker.create_image(
-            Some(CreateImageOptions { 
-                from_image: format!("ghcr.io/{}/{}", payload.user, payload.project), 
-                ..Default::default() 
-            }),
-            None,
-            Some(auth),
-        );
+async fn deploy_git(path: &str) -> &'static str {
+    match Repository::open(path) {
+        Ok(repo) => {
+            debug!("Git repository opened successfully");
+            let mut remote = repo.find_remote("origin").unwrap();
+            if let Err(e) = remote.fetch(&["main"], None, None) {
+                error!("Git fetch failed: {}", e);
+                return "Git Fetch Failed";
+            }
+            info!("✅ Git Fetch Complete for {}", path);
+            "Git Fetch Complete"
+        }
+        Err(e) => {
+            error!("Failed to open repository at {}: {}", path, e);
+            "Repo path error"
+        }
+    }
+}
 
-        while let Some(msg) = stream.next().await {
-            if let Err(e) = msg {
-                eprintln!("Pull error: {}", e);
+async fn deploy_docker(docker: &Docker, path: &str, payload: &WebhookPayload) -> &'static str {
+    let auth = DockerCredentials {
+        username: Some(payload.user.clone()),
+        password: Some(payload.githubtoken.clone()),
+        serveraddress: Some("ghcr.io".to_string()),
+        ..Default::default()
+    };
+
+    let image_name = format!(
+        "ghcr.io/{}/{}", 
+        payload.user.to_lowercase(), 
+        payload.repository.to_lowercase()
+    );
+
+    info!("Starting image pull: {}", image_name);
+
+    let mut stream = docker.create_image(
+        Some(CreateImageOptions { from_image: image_name.clone(), ..Default::default() }),
+        None,
+        Some(auth),
+    );
+
+    while let Some(msg) = stream.next().await {
+        match msg {
+            Ok(progress) => debug!("Pulling... {:?}", progress.status),
+            Err(e) => {
+                error!("Docker pull error for {}: {}", image_name, e);
                 return "Docker Pull Failed";
             }
         }
-
-        // 2. Restart using Docker Compose
-        // This executes: cd /path/to/project && docker compose up -d
-        let status = Command::new("sh")
-            .arg("-c")
-            .arg(format!("cd {} && docker compose up -d", project_path))
-            .status()
-            .await;
-
-        return match status {
-            Ok(s) if s.success() => "Image Pulled and Container Restarted",
-            _ => "Pull success, but Compose restart failed",
-        };
     }
+    info!("✅ Image pulled successfully");
 
-    "Invalid Type"
+    // Trigger Docker Compose
+    debug!("Executing shell: cd {} && docker compose up -d", path);
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg(format!("cd {} && docker compose up -d", path))
+        .output() // Use .output() to capture stdout/stderr
+        .await;
+
+    match output {
+        Ok(out) if out.status.success() => {
+            info!("✅ Container restarted successfully via Docker Compose");
+            "Image Pulled and Container Restarted"
+        }
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            error!("Docker Compose failed with status {}: {}", out.status, stderr);
+            "Pull success, but Compose restart failed"
+        }
+        Err(e) => {
+            error!("Failed to execute Docker Compose command: {}", e);
+            "Command execution error"
+        }
+    }
 }

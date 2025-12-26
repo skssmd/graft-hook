@@ -19,3 +19,5 @@ bollard = "0.18" # Native Docker API
 git2 = "0.20"    # Native Git implementation
 dotenvy = "0.15.7"
 futures-util = "0.3.31"
+tracing = "0.1"
+tracing-subscriber = "0.3"

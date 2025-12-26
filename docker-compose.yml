@@ -7,9 +7,12 @@ services:
         labels:
             - graft.mode=serverbuild
             - traefik.enable=true
-            - traefik.http.routers.graft-hook.docusup.com-frontend.rule=Host(`graft_hook`)
-            - traefik.http.routers.graft_hook-frontend.priority=1
-            - traefik.http.services.graft-hook.docusup.com-frontend.loadbalancer.server.port=3000
+            - traefik.http.routers.graft-hook.rule=Host(`graft-hook.docusup.com`)
+            - traefik.http.routers.graft-hook.priority=1
+            - traefik.http.routers.graft-hook.service=graft-hook-service
+            - traefik.http.services.graft-hook-service.loadbalancer.server.port=3000
+            - traefik.http.routers.graft-hook.entrypoints=websecure
+            - traefik.http.routers.graft-hook.tls.certresolver=letsencrypt
         networks:
             - graft-public
         restart: always
