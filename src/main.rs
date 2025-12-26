@@ -9,13 +9,14 @@ use std::{collections::HashMap, env, sync::Arc};
 use tokio::process::Command;
 use tracing::{info, error, warn, debug, instrument}; // New imports for logging
 
-#[derive(Deserialize, Debug)] // Added Debug for better payload logging
+#[derive(Deserialize, Debug)]
 struct WebhookPayload {
     project: String,
     repository: String,
-    githubtoken: String,
-    user: String,
+    githubtoken: Option<String>,
+    user: Option<String>,
     r#type: String,
+    registry: Option<String>,
 }
 
 type ConfigFile = HashMap<String, String>;
@@ -29,8 +30,8 @@ struct AppState {
 async fn main() {
     // 1. Initialize Logging (Tracing Subscriber)
     tracing_subscriber::fmt()
-        .with_target(false) // Keeps logs clean
-        .compact()          // One-line logs
+        .with_target(false)
+        .compact()
         .init();
 
     dotenvy::dotenv().ok();
@@ -60,7 +61,6 @@ async fn main() {
     axum::serve(listener, app).await.unwrap();
 }
 
-// #[instrument] automatically logs the function arguments (excluding sensitive state)
 #[instrument(skip(state, payload), fields(project = %payload.project, mode = %payload.r#type))]
 async fn handle_deploy(
     State(state): State<Arc<AppState>>,
@@ -75,7 +75,7 @@ async fn handle_deploy(
             path
         },
         None => {
-            error!("Project '{}' not found in projects.json", payload.project);
+            error!("Project '{}' not found in config", payload.project);
             return "Project not found in config";
         }
     };
@@ -87,8 +87,8 @@ async fn handle_deploy(
             deploy_git(project_path).await
         }
         "image" => {
-            info!("Mode selected: Docker Pull & Compose (Bollard)");
-            deploy_docker(&state.docker, project_path, &payload).await
+            info!("Mode selected: Docker Login & Compose Pull");
+            deploy_docker(project_path, &payload).await
         }
         _ => {
             warn!("Invalid deployment type received: {}", payload.r#type);
@@ -116,59 +116,63 @@ async fn deploy_git(path: &str) -> &'static str {
     }
 }
 
-async fn deploy_docker(docker: &Docker, path: &str, payload: &WebhookPayload) -> &'static str {
-    let auth = DockerCredentials {
-        username: Some(payload.user.clone()),
-        password: Some(payload.githubtoken.clone()),
-        serveraddress: Some("ghcr.io".to_string()),
-        ..Default::default()
+async fn deploy_docker(path: &str, payload: &WebhookPayload) -> &'static str {
+    // 1. Resolve Credentials
+    let token = payload.githubtoken.clone()
+        .or_else(|| env::var("DOCKER_TOKEN").ok());
+    
+    let user = payload.user.clone()
+        .or_else(|| env::var("DOCKER_USER").ok());
+
+    let registry = payload.registry.clone()
+        .unwrap_or_else(|| "ghcr.io".to_string());
+
+    // 2. Handle Authentication
+    let (t, u) = match (token, user) {
+        (Some(t), Some(u)) => (t, u),
+        _ => {
+            error!("❌ Missing Docker credentials (token or user) in payload or environment");
+            return "Missing Docker Credentials";
+        }
     };
 
-    let image_name = format!(
-        "ghcr.io/{}/{}", 
-        payload.user.to_lowercase(), 
-        payload.repository.to_lowercase()
-    );
+    info!("Attempting Docker login to {}", registry);
+    let login_status = Command::new("sh")
+        .arg("-c")
+        .arg(format!("echo {} | docker login {} -u {} --password-stdin", t, registry, u))
+        .status()
+        .await;
 
-    info!("Starting image pull: {}", image_name);
-
-    let mut stream = docker.create_image(
-        Some(CreateImageOptions { from_image: image_name.clone(), ..Default::default() }),
-        None,
-        Some(auth),
-    );
-
-    while let Some(msg) = stream.next().await {
-        match msg {
-            Ok(progress) => debug!("Pulling... {:?}", progress.status),
-            Err(e) => {
-                error!("Docker pull error for {}: {}", image_name, e);
-                return "Docker Pull Failed";
-            }
+    match login_status {
+        Ok(status) if status.success() => {
+            info!("✅ Docker login successful");
+        }
+        _ => {
+            error!("❌ Docker login failed for {}", registry);
+            return "Docker Login Failed";
         }
     }
-    info!("✅ Image pulled successfully");
 
-    // Trigger Docker Compose
-    debug!("Executing shell: cd {} && docker compose up -d", path);
+    // 3. Trigger Docker Compose with --pull always
+    info!("Running: docker compose up -d --pull always in {}", path);
     let output = Command::new("sh")
         .arg("-c")
-        .arg(format!("cd {} && docker compose up -d", path))
-        .output() // Use .output() to capture stdout/stderr
+        .arg(format!("cd {} && docker compose up -d --pull always", path))
+        .output()
         .await;
 
     match output {
         Ok(out) if out.status.success() => {
-            info!("✅ Container restarted successfully via Docker Compose");
-            "Image Pulled and Container Restarted"
+            info!("✅ Container(s) updated and restarted successfully via Docker Compose");
+            "Success: Images Pulled and Containers Restarted"
         }
         Ok(out) => {
             let stderr = String::from_utf8_lossy(&out.stderr);
-            error!("Docker Compose failed with status {}: {}", out.status, stderr);
-            "Pull success, but Compose restart failed"
+            error!("Docker Compose failed in {}: {}", path, stderr);
+            "Docker Compose pull/up failed"
         }
         Err(e) => {
-            error!("Failed to execute Docker Compose command: {}", e);
+            error!("Failed to execute Docker Compose command in {}: {}", path, e);
             "Command execution error"
         }
     }
