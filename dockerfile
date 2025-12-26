@@ -5,22 +5,27 @@ WORKDIR /app
 COPY . .
 RUN cargo build --release
 
-# --- Stage 2: Runtime ---
+# --- Stage 2: Runtime (Support for Docker + Compose) ---
 FROM debian:bookworm-slim
 
-# 1. Install Runtime Libs + Docker CLI + Git
+# 1. Install Git and SSL (Required for your Rust app and Git tasks)
 RUN apt-get update && apt-get install -y \
     libssl3 \
     ca-certificates \
-    curl \
-    gnupg \
     git \
-    && install -m 0755 -d /etc/apt/keyrings \
-    && curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg \
-    && chmod a+r /etc/apt/keyrings/docker.gpg \
-    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian bookworm stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null \
-    && apt-get update && apt-get install -y docker-ce-cli docker-compose-plugin \
+    curl \
     && rm -rf /var/lib/apt/lists/*
+
+# 2. Install Static Docker CLI
+RUN curl -L https://download.docker.com/linux/static/stable/x86_64/docker-24.0.7.tgz | \
+    tar -xz -C /usr/local/bin --strip-components=1 docker/docker
+
+# 3. Install Docker Compose Plugin (The "Missing Piece")
+# This puts the plugin where the 'docker' command can find it
+RUN mkdir -p /usr/local/lib/docker/cli-plugins/ && \
+    curl -SL https://github.com/docker/compose/releases/download/v2.24.5/docker-compose-linux-x86_64 \
+    -o /usr/local/lib/docker/cli-plugins/docker-compose && \
+    chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
 
 WORKDIR /app
 COPY --from=builder /app/target/release/graft-hook .
