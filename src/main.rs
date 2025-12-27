@@ -71,7 +71,7 @@ async fn handle_deploy(
 ) -> &'static str {
     info!("📥 Webhook request received");
 
-    println!("{}", payload);
+    println!(payload);
     // 1. Lookup Project Path
     let project_path = match state.config.get(&payload.project) {
         Some(path) => {
