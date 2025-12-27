@@ -1,5 +1,6 @@
 use axum::{extract::State, routing::post, Json, Router};
 use serde::Deserialize;
+use serde_json::json;
 use std::{collections::HashMap, env, sync::Arc};
 use tokio::process::Command;
 use tracing::{info, error, warn, debug, instrument};
@@ -70,6 +71,7 @@ async fn handle_deploy(
 ) -> &'static str {
     info!("📥 Webhook request received");
 
+    println!("{}", payload);
     // 1. Lookup Project Path
     let project_path = match state.config.get(&payload.project) {
         Some(path) => {
