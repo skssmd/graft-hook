@@ -23,7 +23,37 @@ struct ErrorPayload {
     token: String,
 }
 
-type ConfigFile = HashMap<String, String>;
+#[derive(Deserialize, Debug, Clone)]
+struct ProjectConfig {
+    path: String,
+    #[serde(default)]
+    rollback_backups: Option<u32>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+#[serde(untagged)]
+enum ProjectEntry {
+    Path(String),
+    Full(ProjectConfig),
+}
+
+impl ProjectEntry {
+    fn path(&self) -> &str {
+        match self {
+            ProjectEntry::Path(p) => p,
+            ProjectEntry::Full(c) => &c.path,
+        }
+    }
+
+    fn rollback_backups(&self) -> u32 {
+        match self {
+            ProjectEntry::Path(_) => 0,
+            ProjectEntry::Full(c) => c.rollback_backups.unwrap_or(0),
+        }
+    }
+}
+
+type ConfigFile = HashMap<String, ProjectEntry>;
 
 struct AppState {
     config: ConfigFile,
@@ -73,19 +103,25 @@ async fn handle_deploy(
 
     debug!("Payload received: {:?}", payload);
     // 1. Lookup Project Path
-    let project_path = match state.config.get(&payload.project) {
-        Some(path) => {
-            debug!("Project matched: Path is {}", path);
-            path
-        },
+    let project_entry = match state.config.get(&payload.project) {
+        Some(entry) => entry,
         None => {
             error!("Project '{}' not found in config", payload.project);
             return "Project not found in config";
         }
     };
 
-    // 2. Select Deployment Mode
-    match payload.r#type.as_str() {
+    let project_path = project_entry.path();
+    let rollback_limit = project_entry.rollback_backups();
+
+    // 2. Perform Backup if configured
+    if rollback_limit > 0 {
+        create_backup(&payload.project, project_path).await;
+        prune_backups(&payload.project, rollback_limit).await;
+    }
+
+    // 3. Select Deployment Mode
+    let result = match payload.r#type.as_str() {
         "repo" => {
             info!("Mode selected: Git Pull & Compose Build");
             deploy_git(project_path, &payload).await
@@ -98,7 +134,15 @@ async fn handle_deploy(
             warn!("Invalid deployment type received: {}", payload.r#type);
             "Invalid Type"
         }
+    };
+
+    // 4. Post-deploy cleanup (delete old images safely)
+    if result.to_lowercase().contains("success") {
+        debug!("Deployment success, performing safe image cleanup");
+        let _ = Command::new("docker").args(["image", "prune", "-f"]).status().await;
     }
+
+    result
 }
 
 async fn deploy_git(path: &str, payload: &WebhookPayload) -> &'static str {
@@ -283,7 +327,7 @@ async fn handle_error(
 
     // 1. Lookup Project Path
     let project_path = match state.config.get(&payload.project) {
-        Some(path) => path,
+        Some(entry) => entry.path(),
         None => {
             warn!("Project '{}' not found in config", payload.project);
             return "Project not found";
@@ -339,6 +383,106 @@ async fn handle_error(
         _ => {
             warn!("❌ GitHub Auth failed for {}", payload.repository);
             "Authentication Failed"
+        }
+    }
+}
+
+async fn create_backup(project_name: &str, project_path: &str) {
+    let timestamp = match Command::new("date").arg("+%Y%m%d%H%M%S").output().await {
+        Ok(out) => String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        Err(_) => {
+            error!("Failed to get timestamp for backup");
+            return;
+        }
+    };
+
+    let backup_dir = format!("/opt/graft/backup/{}/{}", project_name, timestamp);
+    let compose_dir = format!("{}/compose", backup_dir);
+    let images_dir = format!("{}/images", backup_dir);
+
+    info!("📦 Starting backup for project: {} into {}", project_name, backup_dir);
+
+    // 1. Create directory structure
+    if let Err(e) = std::fs::create_dir_all(&compose_dir) {
+        error!("Failed to create backup compose dir: {}", e);
+        return;
+    }
+    if let Err(e) = std::fs::create_dir_all(&images_dir) {
+        error!("Failed to create backup images dir: {}", e);
+        return;
+    }
+
+    // 2. Backup compose files and env files
+    let _ = Command::new("sh")
+        .arg("-c")
+        .arg(format!("cp {}/docker-compose.yml {}/ 2>/dev/null", project_path, compose_dir))
+        .status()
+        .await;
+    
+    let _ = Command::new("sh")
+        .arg("-c")
+        .arg(format!("cp {}/*.env {}/ 2>/dev/null", project_path, compose_dir))
+        .status()
+        .await;
+
+    // 3. Backup current images using docker save
+    let images_output = Command::new("sh")
+        .arg("-c")
+        .arg(format!("cd {} && docker compose ps --format '{{{{.Image}}}}'", project_path))
+        .output()
+        .await;
+
+    if let Ok(out) = images_output {
+        let images = String::from_utf8_lossy(&out.stdout);
+        for img in images.lines() {
+            let img = img.trim();
+            if !img.is_empty() {
+                let safe_name = img.replace(['/', ':'], "_");
+                let save_path = format!("{}/{}.tar", images_dir, safe_name);
+                info!("💾 Saving image {} to {}", img, save_path);
+                
+                let status = Command::new("docker")
+                    .args(["save", "-o", &save_path, img])
+                    .status()
+                    .await;
+                
+                if let Ok(s) = status {
+                    if s.success() {
+                        // Zip the tar file to save space as requested
+                        let _ = Command::new("gzip").arg(&save_path).status().await;
+                    }
+                }
+            }
+        }
+    }
+
+    info!("✅ Backup completed for {}", project_name);
+}
+
+async fn prune_backups(project_name: &str, limit: u32) {
+    let backup_root = format!("/opt/graft/backup/{}", project_name);
+    let output = Command::new("ls")
+        .arg("-1")
+        .arg(&backup_root)
+        .output()
+        .await;
+
+    if let Ok(out) = output {
+        let mut dirs: Vec<String> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.to_string())
+            .collect();
+        
+        dirs.sort(); // Sorts by timestamp (ascending)
+
+        if dirs.len() > limit as usize {
+            let to_delete = dirs.len() - limit as usize;
+            for i in 0..to_delete {
+                let dir_to_remove = format!("{}/{}", backup_root, dirs[i]);
+                info!("🗑️ Pruning old backup: {}", dir_to_remove);
+                let _ = Command::new("rm").args(["-rf", &dir_to_remove]).status().await;
+            }
         }
     }
 }
