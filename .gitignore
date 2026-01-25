@@ -5,3 +5,4 @@ env/
 WEBHOOK_USAGE.md
 DEPLOYMENT_FLOWS.md
 IMPLEMENTATION_SUMMARY.md
+ping-based-cd.md

@@ -8,27 +8,27 @@ RUN cargo build --release
 # --- Stage 2: Runtime ---
 FROM debian:bookworm-slim
 
-# 1. Install Git, SSL, and Curl
+# 1. Install Dependencies, Git, and Docker (Official Repo)
 RUN apt-get update && apt-get install -y \
     libssl3 \
     ca-certificates \
-    git \
     curl \
+    git \
+    gnupg \
+    && install -m 0755 -d /etc/apt/keyrings \
+    && curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc \
+    && chmod a+r /etc/apt/keyrings/docker.asc \
+    && echo \
+    "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian \
+    $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
+    tee /etc/apt/sources.list.d/docker.list > /dev/null \
+    && apt-get update && apt-get install -y \
+    docker-ce-cli \
+    docker-compose-plugin \
     && rm -rf /var/lib/apt/lists/*
 
 # 1.1 Configure Git
-RUN git config --global --add safe.directory '*' 
-
-# 2. Install Static Docker CLI (v27.5.1 - Latest stable with API 1.47)
-# This will be forward-compatible with your host's v29 engine
-RUN curl -L https://download.docker.com/linux/static/stable/x86_64/docker-27.5.1.tgz | \
-    tar -xz -C /usr/local/bin --strip-components=1 docker/docker
-
-# 3. Install Docker Compose Plugin (v2.32.4)
-RUN mkdir -p /usr/local/lib/docker/cli-plugins/ && \
-    curl -SL https://github.com/docker/compose/releases/download/v2.32.4/docker-compose-linux-x86_64 \
-    -o /usr/local/lib/docker/cli-plugins/docker-compose && \
-    chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+RUN git config --global --add safe.directory '*'
 
 WORKDIR /app
 COPY --from=builder /app/target/release/graft-hook .
